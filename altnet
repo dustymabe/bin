@@ -1,0 +1,100 @@
+#!/bin/bash
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free  Software Foundation; either version 2 of the License, or
+# (at your option)  any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+# MA 02110-1301 USA.
+#
+#
+# purpose: This script will start a new busybox container (to get separate 
+#          mount/net namespaces) and will then do the following:
+#              - The hosts root fs will be mounted on /sysroot
+#              - /etc/resolv.conf will be bind mounted over 
+#                   (to make sure changes to resolv.conf only affect container)
+#              - The container will chroot into /sysroot
+#              - The container will cd to the PWD of the calling process
+#              - The container will execute whatever command/args were provided
+#
+#  author: Dusty Mabe (dusty@dustymabe.com)
+#
+# example: term1$ which altnet 
+#          ~/bin/altnet
+#          term1$ sudo altnet --name altvpn -- openvpn --config ./workvpn.ovpn --up ./client.up
+#          ... Connetion to VPN established ...
+#
+#          term2$ altnet --name altvpn --attach
+#          [altvpn][dustymabe@9378c9311619 ~]$ firefox... 
+#
+set -eu
+
+# Collect the working dir and set some defaults
+DIRECTORY=$PWD
+RUN=0
+ATTACH=0
+
+function run() {
+    # Create a tmpfile to hold the script that will be executed inside
+    # the docker container. The script copies aside the resolv.conf file
+    # and then bind mounts that copy back over the resolv.conf in the
+    # rootfs. This guarantees changes made by openvpn won't propagate 
+    # back to the rootfs. Next chroot into the rootfs, cd to the working
+    # dir and execute openvpn with the args that were given
+    tmpscript=$(mktemp)
+    cat >$tmpscript <<EOF
+cp /sysroot/etc/resolv.conf /tmp/resolv.conf
+mount --bind /tmp/resolv.conf /sysroot/etc/resolv.conf 
+chroot /sysroot/ bash -c "cd $DIRECTORY && $@"
+EOF
+
+    # start up a container to execute the script.
+    [ ! -z "$NAME" ] && NAME="--name $NAME"
+    sudo docker run -it --rm $NAME --privileged -v /:/sysroot busybox sh /sysroot/$tmpscript
+    
+    # once done.. cleanup tmpscript
+    rm -f $tmpscript
+}
+
+function attach() {
+    envvars="PROMPT_COMMAND='echo -n [$NAME]'" # So we know we are in a container
+    envvars+=" DISPLAY=:0" # Set DISPLAY so we can start graphical apps
+    sudo docker exec -it $NAME chroot /sysroot/ su - $USER -c "$envvars /bin/bash"
+}
+
+# Parse args. Right now only accept --name
+# Call getopt to validate the provided input. 
+#options=$(getopt --long run,attach,name: -- "$@")
+options=$(getopt -o '' --long run,attach,name: -- "$@")
+eval set -- "$options" 
+while true; do 
+    case "$1" in 
+    --name)   shift; NAME=$1 ;; # The arg is next in position args 
+    --run)    RUN=1 ;;
+    --attach) ATTACH=1 ;;
+    --) shift; break ;;  # -- indicates we are done with options
+    esac 
+    shift
+done
+
+# Can't have both run and attach
+if [[ "$RUN" == "1" && "$ATTACH" == "1" ]]; then
+    echo "Can't specify --run and --attach" 1>&2
+    exit 1
+fi
+# But need to have at least one of them
+if [[ "$RUN" != "1" && "$ATTACH" != "1" ]]; then
+    echo "Need either --run or --attach" 1>&2
+    exit 1
+fi
+
+[ "$RUN"    == "1" ] && run "$@" && exit $?
+[ "$ATTACH" == "1" ] && attach   && exit $?
